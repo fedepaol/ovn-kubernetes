@@ -105,21 +105,7 @@ if [ "${PARALLEL:-false}" = "true" ]; then
   SKIPPED_TESTS="${SKIPPED_TESTS}|\\[Serial\\]"
 fi
 
-case "$SHARD" in
-	shard-network)
-		FOCUS="\\[sig-network\\]"
-		;;
-	shard-conformance)
-		FOCUS="\\[Conformance\\]|\\[sig-network\\]"
-		;;
-	shard-test)
-		FOCUS=$(echo ${@:2} | sed 's/ /\\s/g')
-		;;
-	*)
-		echo "unknown shard"
-		exit 1
-	;;
-esac
+FOCUS="\\[sig-network\\]"
 
 # setting this env prevents ginkgo e2e from trying to run provider setup
 export KUBERNETES_CONFORMANCE_TEST='y'
@@ -136,10 +122,13 @@ ginkgo --nodes=${NUM_NODES} \
 	--focus=${FOCUS} \
 	--skip=${SKIPPED_TESTS} \
 	--flakeAttempts=${FLAKE_ATTEMPTS} \
-	/usr/local/bin/e2e.test \
+	--dryRun \
+	--v \
+	--noColor \
+	e2e.test \
 	-- \
 	--kubeconfig=${HOME}/admin.conf \
 	--provider=local \
 	--dump-logs-on-failure=false \
-	--report-dir=${E2E_REPORT_DIR}	\
+	--report-dir=./report	\
 	--disable-log-dump=true
