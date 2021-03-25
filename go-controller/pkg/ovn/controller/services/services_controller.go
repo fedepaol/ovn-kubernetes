@@ -6,6 +6,7 @@ import (
 
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/metrics"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/ovn/gateway"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/ovn/loadbalancer"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/util"
 	"github.com/pkg/errors"
@@ -222,7 +223,7 @@ func (c *Controller) syncServices(key string) error {
 		klog.V(4).Infof("Finished syncing service %s on namespace %s : %v", name, namespace, time.Since(startTime))
 		metrics.MetricSyncServiceLatency.WithLabelValues(key).Observe(time.Since(startTime).Seconds())
 	}()
-	
+
 	// Get current Service from the cache
 	service, err := c.serviceLister.Services(namespace).Get(name)
 	// It´s unlikely that we have an error different that "Not Found Object"
@@ -313,10 +314,20 @@ func (c *Controller) syncServices(key string) error {
 			// create the vip = ClusterIP:Port
 			vip := util.JoinHostPortInt32(ip, svcPort.Port)
 			klog.V(4).Infof("Updating service %s/%s with VIP %s %s", name, namespace, vip, svcPort.Protocol)
-			// get the endpoints associated to the vip
-			eps := util.GetLbEndpoints(endpointSlices, svcPort, family)
-			// Reconcile OVN, update the load balancer with current endpoints
+			// get the endpoints associated to the vip, which are the same for each node
+			eps := util.GetLbEndpoints(endpointSlices, svcPort, family, false, "")
 
+			// get local endpoints for each node based gatway router, only used for nodePort Services
+			localEps := make(map[string]util.LbEndpoints)
+			gatewayRouters, _, err := gateway.GetOvnGateways()
+			if err != nil {
+				return err
+			}
+			for _, gatewayRouter := range gatewayRouters {
+				localEps[gatewayRouter] = util.GetLbEndpoints(endpointSlices, svcPort, family, true, gatewayRouter)
+			}
+
+			// Reconcile OVN, update the load balancer with current endpoints
 			// If any of the lbEps contain the a host IP we add to worker/GR LB separately, and not to cluster LB
 			if hasHostEndpoints(eps.IPs) && config.Gateway.Mode == config.GatewayModeShared {
 				if err := createPerNodeVIPs([]string{ip}, svcPort.Protocol, svcPort.Port, eps.IPs, eps.Port); err != nil {
@@ -351,26 +362,13 @@ func (c *Controller) syncServices(key string) error {
 			// Node Port
 			if svcPort.NodePort != 0 {
 				// We need to have only local endpoints on GR here, so repass all endpoint slices so local ones can be found
-				if util.ServiceExternalTrafficPolicyLocal(service) { 
-					klog.V(4).Infof("Service %s/%s has externalTrafficPolicy set to Local", name, namespace)
-					if err := createPerNodePhysicalVIPsLocal(utilnet.IsIPv6String(ip), svcPort.Protocol, svcPort.NodePort,
-						endpointSlices, svcPort, family); err != nil {
-						c.eventRecorder.Eventf(service, v1.EventTypeWarning, "FailedToUpdateOVNLoadBalancer",
-							"Error trying to update OVN Local endpoint LoadBalancer for Service %s/%s: %v",
-							name, namespace, err)
-						return err
-					}
-				} else {
-					if err := createPerNodePhysicalVIPs(utilnet.IsIPv6String(ip), svcPort.Protocol, svcPort.NodePort,
-						eps.IPs, eps.Port); err != nil {
-						c.eventRecorder.Eventf(service, v1.EventTypeWarning, "FailedToUpdateOVNLoadBalancer",
-							"Error trying to update OVN LoadBalancer for Service %s/%s: %v",
-							name, namespace, err)
-						return err
-					}
+				if err := createNodePortVIPs(service, utilnet.IsIPv6String(ip), svcPort.Protocol, svcPort.NodePort, eps, localEps); err != nil {
+					c.eventRecorder.Eventf(service, v1.EventTypeWarning, "FailedToUpdateOVNLoadBalancer",
+						"Error trying to update OVN LoadBalancer for Service %s/%s: %v",
+						name, namespace, err)
+					return err
 				}
-				
-				// Reguardless of LB configuration VIPs willl be the same for both 
+				// Reguardless of LB configuration Vphysical IPs willl be the same for both
 				nodeIPs, err := getNodeIPs(utilnet.IsIPv6String(ip))
 				if err != nil {
 					return err
@@ -380,6 +378,7 @@ func (c *Controller) syncServices(key string) error {
 					c.serviceTracker.updateService(name, namespace, vip, svcPort.Protocol)
 					// mark the vip as processed
 					vipsTracked = vipsTracked.Delete(virtualIPKey(vip, svcPort.Protocol))
+
 				}
 			}
 
