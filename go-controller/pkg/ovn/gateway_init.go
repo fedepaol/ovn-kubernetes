@@ -89,6 +89,8 @@ func gatewayInit(nodeName string, clusterIPSubnet []*net.IPNet, hostSubnets []*n
 		}
 	}
 
+
+	
 	// To decrease the numbers of MAC_Binding entries in a large scale cluster, change the default behavior of always
 	// learning the MAC/IP binding and adding a new MAC_Binding entry. Only do it when necessary.
 	// See details in ovn-northd(8).
@@ -136,6 +138,19 @@ func gatewayInit(nodeName string, clusterIPSubnet []*net.IPNet, hostSubnets []*n
 		kapi.ProtocolUDP:  k8sNSLbUDP,
 		kapi.ProtocolSCTP: k8sNSLbSCTP,
 	}
+
+	var k8sNSLbTCPLocal, k8sNSLbUDPLocal, k8sNSLbSCTPLocal string
+	k8sNSLbTCPLocal, k8sNSLbUDPLocal, k8sNSLbSCTPLocal, err = getGatewayLoadBalancers(gatewayRouter + types.GWRouterLocalLBPostfix)
+	if err != nil {
+		return err
+	}
+
+	gatewayProtoLocalLBMap := map[kapi.Protocol]string{
+		kapi.ProtocolTCP:  k8sNSLbTCPLocal,
+		kapi.ProtocolUDP:  k8sNSLbUDPLocal,
+		kapi.ProtocolSCTP: k8sNSLbSCTPLocal,
+	}
+	
 	workerK8sNSLbTCP, workerK8sNSLbUDP, workerK8sNSLbSCTP, err := loadbalancer.GetWorkerLoadBalancers(nodeName)
 	if err != nil {
 		return err
@@ -155,10 +170,23 @@ func gatewayInit(nodeName string, clusterIPSubnet []*net.IPNet, hostSubnets []*n
 		// router: UDP, TCP, SCTP
 		for _, proto := range enabledProtos {
 			if gatewayProtoLBMap[proto] == "" {
-				gatewayProtoLBMap[proto], stderr, err = util.RunOVNNbctl("--", "create",
+				gatewayProtoLBMap[proto], stderr, err = util.RunOVNNbctl("create",
 					"load_balancer",
 					fmt.Sprintf("external_ids:%s_lb_gateway_router=%s", proto, gatewayRouter),
 					fmt.Sprintf("protocol=%s", strings.ToLower(string(proto))))
+				if err != nil {
+					return fmt.Errorf("failed to create load balancer for gateway router %s for protocol %s: "+
+						"stderr: %q, error: %v", gatewayRouter, proto, stderr, err)
+				}
+			}
+			// Make nodeLocal LBs if needed, only works for SGW
+			if gatewayProtoLocalLBMap[proto] == "" && config.Gateway.Mode != config.GatewayModeLocal {
+				// Create LB's for externalTrafficPolicy=local mode no snat
+				gatewayProtoLocalLBMap[proto], stderr, err = util.RunOVNNbctl("create",
+					"load_balancer",
+					fmt.Sprintf("external_ids:%s_lb_gateway_router=%s", proto, gatewayRouter + types.GWRouterLocalLBPostfix),
+					fmt.Sprintf("protocol=%s", strings.ToLower(string(proto))), 
+					"options:lb_skip_snat=true")
 				if err != nil {
 					return fmt.Errorf("failed to create load balancer for gateway router %s for protocol %s: "+
 						"stderr: %q, error: %v", gatewayRouter, proto, stderr, err)
@@ -168,10 +196,11 @@ func gatewayInit(nodeName string, clusterIPSubnet []*net.IPNet, hostSubnets []*n
 
 		// Local gateway mode does not use GR for ingress node port traffic, it uses mp0 instead
 		if config.Gateway.Mode != config.GatewayModeLocal {
-			// Add north-south load-balancers to the gateway router.
-			lbString := fmt.Sprintf("%s,%s", gatewayProtoLBMap[kapi.ProtocolTCP], gatewayProtoLBMap[kapi.ProtocolUDP])
+			// Add north-south load-balancers, both standard and local to the gateway router.
+			lbString := strings.Join([]string{gatewayProtoLBMap[kapi.ProtocolTCP], gatewayProtoLBMap[kapi.ProtocolUDP],
+				gatewayProtoLocalLBMap[kapi.ProtocolTCP], gatewayProtoLocalLBMap[kapi.ProtocolUDP]}, ",")
 			if sctpSupport {
-				lbString = lbString + "," + gatewayProtoLBMap[kapi.ProtocolSCTP]
+				lbString = lbString + "," + gatewayProtoLBMap[kapi.ProtocolSCTP] + "," + gatewayProtoLocalLBMap[kapi.ProtocolSCTP]
 			}
 			stdout, stderr, err = util.RunOVNNbctl("set", "logical_router", gatewayRouter, "load_balancer="+lbString)
 			if err != nil {
@@ -202,13 +231,25 @@ func gatewayInit(nodeName string, clusterIPSubnet []*net.IPNet, hostSubnets []*n
 	// Create load balancers for workers (to be applied to GR and node switch)
 	for _, proto := range enabledProtos {
 		if workerProtoLBMap[proto] == "" {
-			workerProtoLBMap[proto], stderr, err = util.RunOVNNbctl("--", "create",
-				"load_balancer",
-				fmt.Sprintf("external_ids:%s-%s=%s", types.WorkerLBPrefix, strings.ToLower(string(proto)), nodeName),
-				fmt.Sprintf("protocol=%s", strings.ToLower(string(proto))))
-			if err != nil {
-				return fmt.Errorf("failed to create load balancer for worker node %s for protocol %s: "+
-					"stderr: %q, error: %v", nodeName, proto, stderr, err)
+			if config.Gateway.Mode != config.GatewayModeLocal {
+				workerProtoLBMap[proto], stderr, err = util.RunOVNNbctl("--", "create",
+					"load_balancer",
+					fmt.Sprintf("external_ids:%s-%s=%s", types.WorkerLBPrefix, strings.ToLower(string(proto)), nodeName),
+					fmt.Sprintf("protocol=%s", strings.ToLower(string(proto))),
+					fmt.Sprintf("options:lb_force_snat_ip=router_ip"))
+				if err != nil {
+					return fmt.Errorf("failed to create load balancer for worker node %s for protocol %s: "+
+						"stderr: %q, error: %v", nodeName, proto, stderr, err)
+				}
+			} else {
+				workerProtoLBMap[proto], stderr, err = util.RunOVNNbctl("--", "create",
+					"load_balancer",
+					fmt.Sprintf("external_ids:%s-%s=%s", types.WorkerLBPrefix, strings.ToLower(string(proto)), nodeName),
+					fmt.Sprintf("protocol=%s", strings.ToLower(string(proto))))
+				if err != nil {
+					return fmt.Errorf("failed to create load balancer for worker node %s for protocol %s: "+
+						"stderr: %q, error: %v", nodeName, proto, stderr, err)
+				}
 			}
 		}
 	}
