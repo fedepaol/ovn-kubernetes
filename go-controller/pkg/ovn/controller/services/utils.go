@@ -22,6 +22,92 @@ func deleteVIPsFromAllOVNBalancers(vips sets.String, name, namespace string) err
 	err := deleteVIPsFromNonIdlingOVNBalancers(vips, name, namespace)
 	if err != nil {
 		return errors.Wrapf(err, "Failed to delete vips from ovn balancers %s %s", name, namespace)
+		
+type lbEndpoints struct {
+	IPs  []string
+	Port int32
+}
+
+func getLocalLbEndpoints(slices []*discovery.EndpointSlice, svcPort v1.ServicePort, family v1.IPFamily, gatewayRouter string) lbEndpoints {
+	epsSet := sets.NewString()
+	lbEps := lbEndpoints{[]string{}, 0}
+	hostName := util.GetWorkerFromGatewayRouter(gatewayRouter)
+
+	// return an empty object so the caller don't have to check for nil and can use it as an iterator
+	if len(slices) == 0 {
+		return lbEps
+	}
+
+	for _, slice := range slices {
+		klog.V(4).Infof("Getting local endpoints for slice %s on node %s", slice.Name, hostName)
+		// Only return addresses that belong to the requested IP family
+		if slice.AddressType != discovery.AddressType(family) {
+			klog.V(4).Infof("Slice %s with different IP Family endpoints, requested: %s received: %s",
+				slice.Name, slice.AddressType, family)
+			continue
+		}
+	
+		// build the list of endpoints in the slice
+		for _, port := range slice.Ports {
+			// If Service port name set it must match the name field in the endpoint
+			if svcPort.Name != "" && svcPort.Name != *port.Name {
+				klog.V(5).Infof("Slice %s with different Port name, requested: %s received: %s",
+					slice.Name, svcPort.Name, *port.Name)
+				continue
+			}
+
+			// Get the targeted port
+			tgtPort := int32(svcPort.TargetPort.IntValue())
+			// If this is a string, it will return 0
+			// it has to match the port name
+			// otherwise, it has to match the port number
+			if (tgtPort == 0 && svcPort.TargetPort.String() != *port.Name) ||
+				(tgtPort > 0 && tgtPort != *port.Port) {
+				continue
+			}
+
+			// Skip ports that doesn't match the protocol
+			if *port.Protocol != svcPort.Protocol {
+				klog.V(5).Infof("Slice %s with different Port protocol, requested: %s received: %s",
+					slice.Name, svcPort.Protocol, *port.Protocol)
+				continue
+			}
+			
+			lbEps.Port = *port.Port
+			for _, endpoint := range slice.Endpoints {
+				// Skip endpoints that are not ready
+				if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+					klog.V(4).Infof("Slice endpoints Not Ready")
+					continue
+				}
+
+				// Only add Local endpoints 
+				klog.V(4).Infof("Endpoint is on host %s", endpoint.Topology["kubernetes.io/hostname"])
+				if hostName != endpoint.Topology["kubernetes.io/hostname"] { 
+					klog.V(4).Infof("Endpoint is not local")
+					continue
+				}
+
+				for _, ip := range endpoint.Addresses {
+					klog.V(4).Infof("Adding slice %s endpoints: %v, port: %d", slice.Name, endpoint.Addresses, *port.Port)
+					epsSet.Insert(ip)
+				}
+			}
+		}
+	}
+
+	lbEps.IPs = epsSet.List()
+	klog.V(4).Infof("Local LB Endpoints for %s are: %v on port: %d", slices[0].Labels[discovery.LabelServiceName],
+		lbEps.IPs, lbEps.Port)
+	return lbEps
+}
+// return the endpoints that belong to the IPFamily as a slice of IPs
+func getLbEndpoints(slices []*discovery.EndpointSlice, svcPort v1.ServicePort, family v1.IPFamily) lbEndpoints {
+	epsSet := sets.NewString()
+	lbEps := lbEndpoints{[]string{}, 0}
+	// return an empty object so the caller don't have to check for nil and can use it as an iterator
+	if len(slices) == 0 {
+		return lbEps
 	}
 	err = deleteVIPsFromIdlingBalancer(vips, name, namespace)
 	if err != nil {
@@ -205,6 +291,63 @@ func createPerNodePhysicalVIPs(isIPv6 bool, protocol v1.Protocol, sourcePort int
 				return err
 			}
 			err = loadbalancer.CreateLoadBalancerVIPs(workerLB, physicalIPs, sourcePort, targetIPs, targetPort)
+			if err != nil {
+				klog.Errorf("Failed to create VIP in load balancer %s - %v", workerLB, err)
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// createPerNodePhysicalVIPs adds load balancers on a per node basis for GR and worker switch LBs using physical IPs
+func createPerNodePhysicalVIPsLocal(isIPv6 bool, protocol v1.Protocol, sourcePort int32, slices []*discovery.EndpointSlice, svcPort v1.ServicePort, family v1.IPFamily) error {
+	klog.V(5).Infof("Creating Node VIPs with local endpoints only - %s, %d", protocol, sourcePort)
+	// Each gateway has a separate load-balancer for N/S traffic
+	gatewayRouters, _, err := gateway.GetOvnGateways()
+	if err != nil {
+		return err
+	}
+
+	for _, gatewayRouter := range gatewayRouters {
+		gatewayLB, err := gateway.GetGatewayLoadBalancer(fmt.Sprintf("%s_local", gatewayRouter), protocol)
+		if err != nil {
+			klog.Errorf("Gateway router %s does not have load balancer (%v)",
+				gatewayRouter, err)
+			continue
+		}
+		physicalIPs, err := gateway.GetGatewayPhysicalIPs(gatewayRouter)
+		if err != nil {
+			klog.Errorf("Gateway router %s does not have physical ip (%v)", gatewayRouter, err)
+			continue
+		}
+		// Filter only phyiscal IPs of the same family
+		physicalIPs, err = util.MatchAllIPStringFamily(isIPv6, physicalIPs)
+		if err != nil {
+			klog.Errorf("Failed to find node physical IPs, for gateway: %s, error: %v", gatewayRouter, err)
+			return err
+		}
+		// Get only Local Endpoints
+		localeps := getLocalLbEndpoints(slices, svcPort, family, gatewayRouter)
+
+		// If self ip is in target list, we need to use special IP to allow hairpin back to host
+		newTargets := util.UpdateIPsSlice(localeps.IPs, physicalIPs, []string{types.V4HostMasqueradeIP, types.V6HostMasqueradeIP})
+
+		err = loadbalancer.CreateLoadBalancerVIPs(gatewayLB, physicalIPs, sourcePort, newTargets, localeps.Port)
+		if err != nil {
+			klog.Errorf("Failed to create VIP in load balancer %s - %v", gatewayLB, err)
+			return err
+		}
+
+		if config.Gateway.Mode == config.GatewayModeShared {
+			workerNode := util.GetWorkerFromGatewayRouter(gatewayRouter)
+			workerLB, err := loadbalancer.GetWorkerLoadBalancer(workerNode, protocol)
+			if err != nil {
+				klog.Errorf("Worker switch %s does not have load balancer (%v)", workerNode, err)
+				return err
+			}
+			// Add Local IPs to Worker LBs as well
+			err = loadbalancer.CreateLoadBalancerVIPs(workerLB, physicalIPs, sourcePort, newTargets, localeps.Port)
 			if err != nil {
 				klog.Errorf("Failed to create VIP in load balancer %s - %v", workerLB, err)
 				return err

@@ -222,7 +222,7 @@ func (c *Controller) syncServices(key string) error {
 		klog.V(4).Infof("Finished syncing service %s on namespace %s : %v", name, namespace, time.Since(startTime))
 		metrics.MetricSyncServiceLatency.WithLabelValues(key).Observe(time.Since(startTime).Seconds())
 	}()
-
+	
 	// Get current Service from the cache
 	service, err := c.serviceLister.Services(namespace).Get(name)
 	// It´s unlikely that we have an error different that "Not Found Object"
@@ -350,13 +350,27 @@ func (c *Controller) syncServices(key string) error {
 
 			// Node Port
 			if svcPort.NodePort != 0 {
-				if err := createPerNodePhysicalVIPs(utilnet.IsIPv6String(ip), svcPort.Protocol, svcPort.NodePort,
-					eps.IPs, eps.Port); err != nil {
-					c.eventRecorder.Eventf(service, v1.EventTypeWarning, "FailedToUpdateOVNLoadBalancer",
-						"Error trying to update OVN LoadBalancer for Service %s/%s: %v",
-						name, namespace, err)
-					return err
+				// We need to have only local endpoints on GR here, so repass all endpoint slices so local ones can be found
+				if util.ServiceExternalTrafficPolicyLocal(service) { 
+					klog.V(4).Infof("Service %s/%s has externalTrafficPolicy set to Local", name, namespace)
+					if err := createPerNodePhysicalVIPsLocal(utilnet.IsIPv6String(ip), svcPort.Protocol, svcPort.NodePort,
+						endpointSlices, svcPort, family); err != nil {
+						c.eventRecorder.Eventf(service, v1.EventTypeWarning, "FailedToUpdateOVNLoadBalancer",
+							"Error trying to update OVN Local endpoint LoadBalancer for Service %s/%s: %v",
+							name, namespace, err)
+						return err
+					}
+				} else {
+					if err := createPerNodePhysicalVIPs(utilnet.IsIPv6String(ip), svcPort.Protocol, svcPort.NodePort,
+						eps.IPs, eps.Port); err != nil {
+						c.eventRecorder.Eventf(service, v1.EventTypeWarning, "FailedToUpdateOVNLoadBalancer",
+							"Error trying to update OVN LoadBalancer for Service %s/%s: %v",
+							name, namespace, err)
+						return err
+					}
 				}
+				
+				// Reguardless of LB configuration VIPs willl be the same for both 
 				nodeIPs, err := getNodeIPs(utilnet.IsIPv6String(ip))
 				if err != nil {
 					return err
