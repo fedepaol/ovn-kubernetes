@@ -282,14 +282,34 @@ func UseEndpointSlices(kubeClient kubernetes.Interface) bool {
 }
 
 type LbEndpoints struct {
-	IPs  []string
+	EPs  []discovery.Endpoint
 	Port int32
 }
 
+func (e LbEndpoints) IPs() []string {
+	ipsSet := sets.NewString()
+	for _, endpoint := range e.EPs {
+		for _, ip := range endpoint.Addresses {
+			ipsSet.Insert(ip)
+		}
+	}
+	return ipsSet.List()
+}
+
+func (e LbEndpoints) LocalToNode(grName string) LbEndpoints {
+	res := LbEndpoints{Port: e.Port, EPs: make([]discovery.Endpoint, 0)}
+
+	for _, ep := range e.EPs {
+		if GetWorkerFromGatewayRouter(grName) == ep.Topology["kubernetes.io/hostname"] {
+			res.EPs = append(res.EPs, ep)
+		}
+	}
+	return res
+}
+
 // GetLbEndpoints return the endpoints that belong to the IPFamily as a slice of IPs
-func GetLbEndpoints(slices []*discovery.EndpointSlice, svcPort kapi.ServicePort, family kapi.IPFamily, nodeLocal bool, gatewayRouter string) LbEndpoints {
-	epsSet := sets.NewString()
-	lbEps := LbEndpoints{[]string{}, 0}
+func GetLbEndpoints(slices []*discovery.EndpointSlice, svcPort kapi.ServicePort, family kapi.IPFamily) LbEndpoints {
+	lbEps := LbEndpoints{[]discovery.Endpoint{}, 0}
 	// return an empty object so the caller don't have to check for nil and can use it as an iterator
 	if len(slices) == 0 {
 		return lbEps
@@ -337,27 +357,13 @@ func GetLbEndpoints(slices []*discovery.EndpointSlice, svcPort kapi.ServicePort,
 					klog.V(4).Infof("Slice endpoints Not Ready")
 					continue
 				}
-
-				// For externalTrafficPolicy=Local only get node local endpoints
-				if nodeLocal {
-					klog.V(4).Infof("Endpoint is on host %s", endpoint.Topology["kubernetes.io/hostname"])
-					if GetWorkerFromGatewayRouter(gatewayRouter) != endpoint.Topology["kubernetes.io/hostname"] {
-						klog.V(4).Infof("Endpoint is not local")
-						continue
-					}
-				}
-
-				for _, ip := range endpoint.Addresses {
-					klog.V(4).Infof("Adding slice %s endpoints: %v, port: %d", slice.Name, endpoint.Addresses, *port.Port)
-					epsSet.Insert(ip)
-				}
+				lbEps.EPs = append(lbEps.EPs, endpoint)
 			}
 		}
 	}
 
-	lbEps.IPs = epsSet.List()
 	klog.V(4).Infof("LB Endpoints for %s are: %v on port: %d", slices[0].Labels[discovery.LabelServiceName],
-		lbEps.IPs, lbEps.Port)
+		lbEps.IPs(), lbEps.Port)
 	return lbEps
 }
 
@@ -376,8 +382,8 @@ func HasValidEndpoint(service *kapi.Service, slices []*discovery.EndpointSlice) 
 			family = kapi.IPv6Protocol
 		}
 		for _, svcPort := range service.Spec.Ports {
-			eps := GetLbEndpoints(slices, svcPort, family, false, "")
-			if len(eps.IPs) > 0 {
+			eps := GetLbEndpoints(slices, svcPort, family)
+			if len(eps.IPs()) > 0 {
 				return true
 			}
 		}

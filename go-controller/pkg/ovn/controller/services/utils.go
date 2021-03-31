@@ -167,25 +167,18 @@ func createPerNodeVIPs(svcIPs []string, protocol v1.Protocol, sourcePort int32, 
 	return nil
 }
 
-func createNodePortVIPs(service *v1.Service, isIpv6 bool, nodePortProtocol v1.Protocol, nodePort int32, eps util.LbEndpoints, localEps map[string]util.LbEndpoints) error {
-	if util.ServiceExternalTrafficPolicyLocal(service) {
-		klog.V(4).Infof("Service %s/%s has externalTrafficPolicy set to Local", service.Name, service.Namespace)
-		if err := createPerNodePhysicalVIPs(isIpv6, nodePortProtocol, nodePort,
-			eps.IPs, eps.Port, localEps, true); err != nil {
-			return err
-		}
-	} else {
-		if err := createPerNodePhysicalVIPs(isIpv6, nodePortProtocol, nodePort,
-			eps.IPs, eps.Port, localEps, false); err != nil {
-			return err
-		}
+func createNodePortVIPs(service *v1.Service, isIpv6 bool, nodePortProtocol v1.Protocol, nodePort int32, eps util.LbEndpoints) error {
+	isPolicyLocal := util.ServiceExternalTrafficPolicyLocal(service)
+	if err := createPerNodePhysicalVIPs(isIpv6, nodePortProtocol, nodePort, eps, eps.Port, isPolicyLocal); err != nil {
+		return err
 	}
 	return nil
 }
 
 // createPerNodePhysicalVIPs adds load balancers on a per node basis for GR and worker switch LBs using physical IPs
-func createPerNodePhysicalVIPs(isIPv6 bool, protocol v1.Protocol, sourcePort int32, targetIPs []string, targetPort int32, localEps map[string]util.LbEndpoints, nodeLocal bool) error {
-	klog.V(5).Infof("Creating Node VIPs - %s, %d, [%v], %d", protocol, sourcePort, targetIPs, targetPort)
+func createPerNodePhysicalVIPs(isIPv6 bool, protocol v1.Protocol, sourcePort int32, eps util.LbEndpoints, targetPort int32, nodeLocal bool) error {
+	targetIPs := eps.IPs()
+	klog.V(5).Infof("Creating Node VIPs - %s, %d, [%v], %d %v", protocol, sourcePort, eps.IPs(), targetPort, nodeLocal)
 	// Each gateway has a separate load-balancer for N/S traffic
 	gatewayRouters, _, err := gateway.GetOvnGateways()
 	if err != nil {
@@ -224,13 +217,13 @@ func createPerNodePhysicalVIPs(isIPv6 bool, protocol v1.Protocol, sourcePort int
 			return err
 		}
 
-		newTargets := util.UpdateIPsSlice(targetIPs, physicalIPs, []string{types.V4HostMasqueradeIP, types.V6HostMasqueradeIP})
-
-		// If self ip is in target list, we need to use special IP to allow hairpin back to host
+		newEps := eps
 		if nodeLocal {
-			// If ETP is set to "local" only look at the node local endpoints
-			newTargets = util.UpdateIPsSlice(localEps[gatewayRouter].IPs, physicalIPs, []string{types.V4HostMasqueradeIP, types.V6HostMasqueradeIP})
+			newEps = eps.LocalToNode(gatewayRouter)
+			targetIPs = newEps.IPs()
 		}
+
+		newTargets := util.UpdateIPsSlice(targetIPs, physicalIPs, []string{types.V4HostMasqueradeIP, types.V6HostMasqueradeIP})
 
 		err = loadbalancer.CreateLoadBalancerVIPs(gatewayLB, physicalIPs, sourcePort, newTargets, targetPort)
 		if err != nil {
