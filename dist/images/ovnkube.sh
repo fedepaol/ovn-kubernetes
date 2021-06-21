@@ -208,6 +208,8 @@ ovnkube_node_mode=${OVNKUBE_NODE_MODE:-"full"}
 # OVN_ENCAP_IP - encap IP to be used for OVN traffic on the node
 ovn_encap_ip=${OVN_ENCAP_IP:-}
 
+ovn_ex_gw_network_interface=${OVN_EX_GW_NETWORK_INTERFACE:-}
+
 # Determine the ovn rundir.
 if [[ -f /usr/bin/ovn-appctl ]]; then
   # ovn-appctl is present. Use new ovn run dir path.
@@ -910,6 +912,12 @@ ovn-master() {
 
   ovnkube_master_metrics_bind_address="${metrics_endpoint_ip}:9409"
 
+  egress_interface=
+  if [[ -n ${ovn_ex_gw_network_interface} ]]; then
+      egress_interface="--egress-interface ${ovn_ex_gw_network_interface}"
+  fi
+  echo "egress_interface=${egress_interface}"
+
   echo "=============== ovn-master ========== MASTER ONLY"
   /usr/bin/ovnkube \
     --init-master ${K8S_NODE} \
@@ -934,6 +942,7 @@ ovn-master() {
     ${egressip_enabled_flag} \
     ${egressfirewall_enabled_flag} \
     --metrics-bind-address ${ovnkube_master_metrics_bind_address} \
+    ${egress_interface} \
     --host-network-namespace ${ovn_host_network_namespace} &
 
   echo "=============== ovn-master ========== running"
@@ -1049,6 +1058,11 @@ ovn-node() {
       ipfix_targets="--ipfix-targets ${ovn_ipfix_targets}"
   fi
 
+  egress_interface=
+  if [[ -n ${ovn_ex_gw_network_interface} ]]; then
+      egress_interface="--egress-interface ${ovn_ex_gw_network_interface}"
+  fi
+
   ovn_encap_ip_flag=
   if [[ ${ovn_encap_ip} != "" ]]; then
     ovn_encap_ip_flag="--encap-ip=${ovn_encap_ip}"
@@ -1126,6 +1140,7 @@ ovn-node() {
     --ovn-metrics-bind-address ${ovn_metrics_bind_address} \
     --metrics-bind-address ${ovnkube_node_metrics_bind_address} \
      ${ovnkube_node_mode_flag} \
+    ${egress_interface} \
     --host-network-namespace ${ovn_host_network_namespace} &
 
   wait_for_event attempts=3 process_ready ovnkube

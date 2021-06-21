@@ -41,6 +41,7 @@ usage() {
     echo "                 [-dbl|--dbchecker-loglevel <num>] [-ndl|--ovn-loglevel-northd <loglevel>]"
     echo "                 [-nbl|--ovn-loglevel-nb <loglevel>] [-sbl|--ovn-loglevel-sb <loglevel>]"
     echo "                 [-cl |--ovn-loglevel-controller <loglevel>] [-dl|--ovn-loglevel-nbctld <loglevel>] |"
+    echo "                 [-eb |--egress-gw-bridge]"
     echo "                 [-h]]"
     echo ""
     echo "-cf  | --config-file               Name of the KIND J2 configuration file."
@@ -75,6 +76,7 @@ usage() {
     echo "-sbl | --ovn-loglevel-sb           Log config for southboudn DB DEFAULT: '-vconsole:info -vfile:info'."
     echo "-cl  | --ovn-loglevel-controller   Log config for ovn-controller DEFAULT: '-vconsole:info'."
     echo "-dl  | --ovn-loglevel-nbctld       Log config for nbctl daemon DEFAULT: '-vconsole:info'."
+    echo "-eb  | --egress-gw-bridge          The interface to be used as bridge for external gw traffic."
     echo "--delete                      	   Delete current cluster"
     echo ""
 }
@@ -164,6 +166,9 @@ parse_args() {
                                                 fi
                                                 DBCHECKER_LOG_LEVEL=$1
                                                 ;;
+            -eb | --egress-bridge )               shift
+                                                OVN_EX_GW_NETWORK_INTERFACE=$1
+                                                ;;
             -ndl | --ovn-loglevel-northd )      shift
                                                 OVN_LOG_LEVEL_NORTHD=$1
                                                 ;;
@@ -224,6 +229,7 @@ print_params() {
      echo "OVN_LOG_LEVEL_CONTROLLER = $OVN_LOG_LEVEL_CONTROLLER"
      echo "OVN_LOG_LEVEL_NBCTLD = $OVN_LOG_LEVEL_NBCTLD"
      echo "OVN_HOST_NETWORK_NAMESPACE = $OVN_HOST_NETWORK_NAMESPACE"
+     echo "OVN_EX_GW_NETWORK_INTERFACE = $OVN_EX_GW_NETWORK_INTERFACE"
      echo ""
 }
 
@@ -260,13 +266,14 @@ set_default_params() {
   OVN_LOG_LEVEL_SB=${OVN_LOG_LEVEL_SB:-"-vconsole:info -vfile:info"}
   OVN_LOG_LEVEL_CONTROLLER=${OVN_LOG_LEVEL_CONTROLLER:-"-vconsole:info"}
   OVN_LOG_LEVEL_NBCTLD=${OVN_LOG_LEVEL_NBCTLD:-"-vconsole:info"}
-
+  OVN_EX_GW_NETWORK_INTERFACE=${OVN_EX_GW_NETWORK_INTERFACE:-""}
   # Input not currently validated. Modify outside script at your own risk.
   # These are the same values defaulted to in KIND code (kind/default.go).
   # NOTE: KIND NET_CIDR_IPV6 default use a /64 but OVN have a /64 per host
   # so it needs to use a larger subnet
   #  Upstream - NET_CIDR_IPV6=fd00:10:244::/64 SVC_CIDR_IPV6=fd00:10:96::/112
   NET_CIDR_IPV4=${NET_CIDR_IPV4:-10.244.0.0/16}
+  NET_SECOND_CIDR_IPV4=${NET_SECOND_CIDR_IPV4:-172.19.0.0/16}
   SVC_CIDR_IPV4=${SVC_CIDR_IPV4:-10.96.0.0/16}
   NET_CIDR_IPV6=${NET_CIDR_IPV6:-fd00:10:244::/48}
   SVC_CIDR_IPV6=${SVC_CIDR_IPV6:-fd00:10:96::/112}
@@ -492,7 +499,8 @@ create_ovn_kube_manifests() {
     --egress-ip-enable=true \
     --egress-firewall-enable=true \
     --v4-join-subnet="${JOIN_SUBNET_IPV4}" \
-    --v6-join-subnet="${JOIN_SUBNET_IPV6}"
+    --v6-join-subnet="${JOIN_SUBNET_IPV6}" \
+    --ex-gw-network-interface="${OVN_EX_GW_NETWORK_INTERFACE}"
   popd
 }
 
@@ -566,6 +574,21 @@ cleanup_kube_proxy_iptables() {
   done
 }
 
+docker_create_second_interface() {
+  if [ -z "$OVN_EX_GW_NETWORK_INTERFACE" ]; then
+    return
+  fi
+  echo "adding second interfaces to nodes"
+
+  # Create the network as dual stack, regardless of the type of the deployment. Ignore if already exists.
+  docker network create --driver=bridge network2 --subnet=172.19.0.0/16 --subnet=fc00:f853:ccd:e794::/64 || true
+
+  KIND_NODES=$(kind get nodes --name "${KIND_CLUSTER_NAME}")
+  for n in $KIND_NODES; do
+    docker network connect network2 "$n"
+  done
+}
+
 sleep_until_pods_settle() {
   echo "Pods are all up, allowing things settle for 30 seconds..."
   sleep 30
@@ -583,6 +606,7 @@ check_ipv6
 set_cluster_cidr_ip_families
 create_kind_cluster
 docker_disable_ipv6
+docker_create_second_interface
 coredns_patch
 build_ovn_image
 detect_apiserver_url
