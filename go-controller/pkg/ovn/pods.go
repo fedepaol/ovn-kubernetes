@@ -130,6 +130,7 @@ func (oc *Controller) deleteLogicalPort(pod *kapi.Pod) {
 	}
 
 	if config.Gateway.DisableSNATMultipleGWs {
+		fmt.Println("FEDE disable snat")
 		oc.deletePerPodGRSNAT(pod.Spec.NodeName, portInfo.ips)
 	}
 	oc.deleteGWRoutesForPod(pod.Namespace, portInfo.ips)
