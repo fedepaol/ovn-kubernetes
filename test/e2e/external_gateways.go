@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"flag"
 	"fmt"
 	"net"
 	"strconv"
@@ -26,6 +27,8 @@ const (
 	srcUDPPort             = 90
 )
 
+var externalContainerNetwork = flag.String("exgwnetwork", "network2", "the docker network to attach the container acting as ex gateway to")
+
 // gatewayTestIPs collects all the addresses required for a external gateway
 // test.
 type gatewayTestIPs struct {
@@ -43,7 +46,6 @@ var _ = ginkgo.Describe("e2e non-vxlan external gateway through a gateway pod", 
 		svcname          string = "externalgw-pod-novxlan"
 		gwContainer1     string = "ex-gw-container1"
 		gwContainer2     string = "ex-gw-container2"
-		ciNetworkName    string = "kind"
 		defaultNamespace string = "default"
 		srcPingPodName   string = "e2e-exgw-src-ping-pod"
 		gatewayPodName1  string = "e2e-gateway-pod1"
@@ -105,6 +107,12 @@ var _ = ginkgo.Describe("e2e non-vxlan external gateway through a gateway pod", 
 				skipper.Skipf("Skipping as pod ip / node ip are not set pod ip %s node ip %s", addresses.srcPodIP, addresses.nodeIP)
 			}
 
+			ginkgo.By(fmt.Sprintf("Verifying connectivity to the pod [%s] from external gateways", addresses.srcPodIP))
+			_, err := runCommand("docker", "exec", gwContainer1, "ping", "-c", testTimeout, addresses.srcPodIP)
+			framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer1)
+			_, err = runCommand("docker", "exec", gwContainer2, "ping", "-c", testTimeout, addresses.srcPodIP)
+			framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer2)
+
 			tcpDumpSync := sync.WaitGroup{}
 			checkPingOnContainer := func(container string) error {
 				defer ginkgo.GinkgoRecover()
@@ -134,12 +142,6 @@ var _ = ginkgo.Describe("e2e non-vxlan external gateway through a gateway pod", 
 			}
 			pingSync.Wait()
 			tcpDumpSync.Wait()
-
-			ginkgo.By(fmt.Sprintf("Verifying connectivity to the pod [%s] from external gateways", addresses.srcPodIP))
-			_, err := runCommand("docker", "exec", gwContainer1, "ping", "-c", testTimeout, addresses.srcPodIP)
-			framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer1)
-			_, err = runCommand("docker", "exec", gwContainer2, "ping", "-c", testTimeout, addresses.srcPodIP)
-			framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer2)
 		},
 		ginkgotable.Entry("ipv4", &addressesv4, "icmp"),
 		ginkgotable.Entry("ipv6", &addressesv6, "icmp6"))
@@ -148,6 +150,10 @@ var _ = ginkgo.Describe("e2e non-vxlan external gateway through a gateway pod", 
 		func(protocol string, addresses *gatewayTestIPs, destPort, destPortOnPod int) {
 			if addresses.srcPodIP == "" || addresses.nodeIP == "" {
 				skipper.Skipf("Skipping as pod ip / node ip are not set pod ip %s node ip %s", addresses.srcPodIP, addresses.nodeIP)
+			}
+
+			for _, container := range []string{gwContainer1, gwContainer2} {
+				reachPodFromContainer(addresses.srcPodIP, strconv.Itoa(destPortOnPod), srcPingPodName, container, protocol)
 			}
 
 			expectedHostNames := make(map[string]struct{})
@@ -189,10 +195,6 @@ var _ = ginkgo.Describe("e2e non-vxlan external gateway through a gateway pod", 
 				framework.Failf("Failed to hit all the external gateways via for protocol %s, diff %s", protocol, cmp.Diff(expectedHostNames, returnedHostNames))
 			}
 
-			for _, container := range []string{gwContainer1, gwContainer2} {
-				reachPodFromContainer(addresses.srcPodIP, strconv.Itoa(destPortOnPod), srcPingPodName, container, protocol)
-			}
-
 		},
 		ginkgotable.Entry("UDP ipv4", "udp", &addressesv4, externalUDPPort, srcUDPPort),
 		ginkgotable.Entry("TCP ipv4", "tcp", &addressesv4, externalTCPPort, srcHTTPPort),
@@ -209,12 +211,11 @@ var _ = ginkgo.Describe("e2e non-vxlan external gateway through a gateway pod", 
 // Two additional gateways are added to verify the tcp / udp protocols.
 // They run the netexec command, and the pod asks to return their hostname.
 // The test checks that both hostnames are collected at least once.
-var _ = ginkgo.Describe("e2e multiple external gateway validation", func() {
+var _ = ginkgo.FDescribe("e2e multiple external gateway validation", func() {
 	const (
 		svcname         string = "novxlan-externalgw-ecmp"
 		gwContainer1    string = "gw-test-container1"
 		gwContainer2    string = "gw-test-container2"
-		ciNetworkName   string = "kind"
 		testTimeout     string = "30"
 		ecmpRetry       int    = 20
 		srcPodName             = "e2e-exgw-src-pod"
@@ -261,6 +262,18 @@ var _ = ginkgo.Describe("e2e multiple external gateway validation", func() {
 
 		annotateNamespaceForGateway(f.Namespace.Name, false, addresses.gatewayIPs[0], addresses.gatewayIPs[1])
 
+		ginkgo.By("Verifying connectivity to the pod from external gateways")
+		_, err := runCommand("docker", "exec", gwContainer1, "ping", "-c", testTimeout, addresses.srcPodIP)
+		framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer1)
+		_, err = runCommand("docker", "exec", gwContainer2, "ping", "-c", testTimeout, addresses.srcPodIP)
+		framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer2)
+
+		ginkgo.By("Verifying connectivity to the pod from external gateways with large packets > pod MTU")
+		_, err = runCommand("docker", "exec", gwContainer1, "ping", "-s", "1420", "-c", testTimeout, addresses.srcPodIP)
+		framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer1)
+		_, err = runCommand("docker", "exec", gwContainer2, "ping", "-s", "1420", "-c", testTimeout, addresses.srcPodIP)
+		framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer2)
+
 		// Verify the gateways and remote loopback addresses are reachable from the pod.
 		// Iterate checking connectivity to the loopbacks on the gateways until tcpdump see
 		// the traffic or 20 attempts fail. Odds of a false negative here is ~ (1/2)^20
@@ -305,18 +318,6 @@ var _ = ginkgo.Describe("e2e multiple external gateway validation", func() {
 		pingSync.Wait()
 		tcpDumpSync.Wait()
 
-		ginkgo.By("Verifying connectivity to the pod from external gateways")
-		_, err := runCommand("docker", "exec", gwContainer1, "ping", "-c", testTimeout, addresses.srcPodIP)
-		framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer1)
-		_, err = runCommand("docker", "exec", gwContainer2, "ping", "-c", testTimeout, addresses.srcPodIP)
-		framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer2)
-
-		ginkgo.By("Verifying connectivity to the pod from external gateways with large packets > pod MTU")
-		_, err = runCommand("docker", "exec", gwContainer1, "ping", "-s", "1420", "-c", testTimeout, addresses.srcPodIP)
-		framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer1)
-		_, err = runCommand("docker", "exec", gwContainer2, "ping", "-s", "1420", "-c", testTimeout, addresses.srcPodIP)
-		framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer2)
-
 	}, ginkgotable.Entry("IPV4", &addressesv4, "icmp"),
 		ginkgotable.Entry("IPV6", &addressesv6, "icmp6"))
 
@@ -328,6 +329,10 @@ var _ = ginkgo.Describe("e2e multiple external gateway validation", func() {
 		}
 
 		annotateNamespaceForGateway(f.Namespace.Name, false, addresses.gatewayIPs[0], addresses.gatewayIPs[1])
+
+		for _, container := range []string{gwContainer1, gwContainer2} {
+			reachPodFromContainer(addresses.srcPodIP, strconv.Itoa(destPortOnPod), srcPodName, container, protocol)
+		}
 
 		expectedHostNames := hostNamesForContainers([]string{gwContainer1, gwContainer2})
 		framework.Logf("Expected hostnames are %v", expectedHostNames)
@@ -354,10 +359,6 @@ var _ = ginkgo.Describe("e2e multiple external gateway validation", func() {
 			framework.Failf("Failed to hit all the external gateways via for protocol %s, diff %s", protocol, cmp.Diff(expectedHostNames, returnedHostNames))
 		}
 
-		for _, container := range []string{gwContainer1, gwContainer2} {
-			reachPodFromContainer(addresses.srcPodIP, strconv.Itoa(destPortOnPod), srcPodName, container, protocol)
-		}
-
 	}, ginkgotable.Entry("IPV4 udp", &addressesv4, "udp", externalUDPPort, srcUDPPort),
 		ginkgotable.Entry("IPV4 tcp", &addressesv4, "tcp", externalTCPPort, srcHTTPPort),
 		ginkgotable.Entry("IPV6 udp", &addressesv6, "udp", externalUDPPort, srcUDPPort),
@@ -367,13 +368,12 @@ var _ = ginkgo.Describe("e2e multiple external gateway validation", func() {
 // BFD Tests are dual of external gateway. The only difference is that they enable BFD on ovn and
 // on the external containers, and after doing one round veryfing that the traffic reaches both containers,
 // they delete one and verify that the traffic is always reaching the only alive container.
-var _ = ginkgo.Context("BFD", func() {
+var _ = ginkgo.FContext("BFD", func() {
 	var _ = ginkgo.Describe("e2e non-vxlan external gateway through a gateway pod", func() {
 		const (
 			svcname          string = "externalgw-pod-novxlan"
 			gwContainer1     string = "ex-gw-container1"
 			gwContainer2     string = "ex-gw-container2"
-			ciNetworkName    string = "kind"
 			defaultNamespace string = "default"
 			srcPingPodName   string = "e2e-exgw-src-ping-pod"
 			gatewayPodName1  string = "e2e-gateway-pod1"
@@ -440,6 +440,12 @@ var _ = ginkgo.Context("BFD", func() {
 
 				framework.ExpectEqual(isBFDPaired(gwContainer1, addresses.nodeIP), true, "Bfd not paired")
 				framework.ExpectEqual(isBFDPaired(gwContainer2, addresses.nodeIP), true, "Bfd not paired")
+
+				ginkgo.By("Verifying connectivity to the pod from external gateways")
+				_, err := runCommand("docker", "exec", gwContainer1, "ping", "-c", testTimeout, addresses.srcPodIP)
+				framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer1)
+				_, err = runCommand("docker", "exec", gwContainer2, "ping", "-c", testTimeout, addresses.srcPodIP)
+				framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer2)
 
 				tcpDumpSync := sync.WaitGroup{}
 				checkPingOnContainer := func(container string, wg *sync.WaitGroup) error {
@@ -514,6 +520,11 @@ var _ = ginkgo.Context("BFD", func() {
 				framework.ExpectEqual(isBFDPaired(gwContainer1, addresses.nodeIP), true, "Bfd not paired")
 				framework.ExpectEqual(isBFDPaired(gwContainer2, addresses.nodeIP), true, "Bfd not paired")
 
+				_, err := runCommand("docker", "exec", gwContainer1, "ping", "-c", testTimeout, addresses.srcPodIP)
+				framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer1)
+				_, err = runCommand("docker", "exec", gwContainer2, "ping", "-c", testTimeout, addresses.srcPodIP)
+				framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer2)
+
 				expectedHostNames := hostNamesForContainers([]string{gwContainer1, gwContainer2})
 				framework.Logf("Expected hostnames are %v", expectedHostNames)
 
@@ -572,7 +583,6 @@ var _ = ginkgo.Context("BFD", func() {
 			svcname         string = "novxlan-externalgw-ecmp"
 			gwContainer1    string = "gw-test-container1"
 			gwContainer2    string = "gw-test-container2"
-			ciNetworkName   string = "kind"
 			testTimeout     string = "30"
 			ecmpRetry       int    = 20
 			srcPodName             = "e2e-exgw-src-pod"
@@ -626,6 +636,11 @@ var _ = ginkgo.Context("BFD", func() {
 			time.Sleep(3 * time.Second)
 			framework.ExpectEqual(isBFDPaired(gwContainer1, addresses.nodeIP), true, "Bfd not paired")
 			framework.ExpectEqual(isBFDPaired(gwContainer2, addresses.nodeIP), true, "Bfd not paired")
+
+			_, err := runCommand("docker", "exec", gwContainer1, "ping", "-c", testTimeout, addresses.srcPodIP)
+			framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer1)
+			_, err = runCommand("docker", "exec", gwContainer2, "ping", "-c", testTimeout, addresses.srcPodIP)
+			framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer2)
 
 			// Verify the gateways and remote loopback addresses are reachable from the pod.
 			// Iterate checking connectivity to the loopbacks on the gateways until tcpdump see
@@ -716,6 +731,11 @@ var _ = ginkgo.Context("BFD", func() {
 			framework.ExpectEqual(isBFDPaired(gwContainer1, addresses.nodeIP), true, "Bfd not paired")
 			framework.ExpectEqual(isBFDPaired(gwContainer2, addresses.nodeIP), true, "Bfd not paired")
 
+			_, err := runCommand("docker", "exec", gwContainer1, "ping", "-c", testTimeout, addresses.srcPodIP)
+			framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer1)
+			_, err = runCommand("docker", "exec", gwContainer2, "ping", "-c", testTimeout, addresses.srcPodIP)
+			framework.ExpectNoError(err, "Failed to ping ", addresses.srcPodIP, gwContainer2)
+
 			expectedHostNames := hostNamesForContainers([]string{gwContainer1, gwContainer2})
 			framework.Logf("Expected hostnames are %v", expectedHostNames)
 
@@ -770,8 +790,8 @@ func setupGatewayContainers(f *framework.Framework, nodes *v1.NodeList, gwContai
 	addressesv6 := gatewayTestIPs{targetIPs: make([]string, 0)}
 
 	ginkgo.By("Creating the gateway containers for the icmp test")
-	addressesv4.gatewayIPs[0], addressesv6.gatewayIPs[0] = createClusterExternalContainer(gwContainer1, externalContainerImage, []string{"-itd", "--privileged", "--network", ciNetworkName}, []string{})
-	addressesv4.gatewayIPs[1], addressesv6.gatewayIPs[1] = createClusterExternalContainer(gwContainer2, externalContainerImage, []string{"-itd", "--privileged", "--network", ciNetworkName}, []string{})
+	addressesv4.gatewayIPs[0], addressesv6.gatewayIPs[0] = createClusterExternalContainer(gwContainer1, externalContainerImage, []string{"-itd", "--privileged", "--network", *externalContainerNetwork}, []string{})
+	addressesv4.gatewayIPs[1], addressesv6.gatewayIPs[1] = createClusterExternalContainer(gwContainer2, externalContainerImage, []string{"-itd", "--privileged", "--network", *externalContainerNetwork}, []string{})
 
 	// Set up the destination ips to reach via the gw
 	for lastOctet := 1; lastOctet <= numOfIPs; lastOctet++ {
@@ -786,7 +806,7 @@ func setupGatewayContainers(f *framework.Framework, nodes *v1.NodeList, gwContai
 	framework.Logf("target ipsv6 are %v", addressesv6.targetIPs)
 
 	node := nodes.Items[0]
-	addressesv4.nodeIP, addressesv6.nodeIP = getNodeAddresses(&node)
+	addressesv4.nodeIP, addressesv6.nodeIP = getContainerAddressesForNetwork(node.Name, *externalContainerNetwork)
 	framework.Logf("the pod side node is %s and the source node ip is %s - %s", node.Name, addressesv4.nodeIP, addressesv6.nodeIP)
 
 	ginkgo.By("Creating the source pod to reach the destination ips from")
@@ -842,7 +862,7 @@ func setupGatewayContainers(f *framework.Framework, nodes *v1.NodeList, gwContai
 			}
 
 			ginkgo.By(fmt.Sprintf("Adding a route from %s to the src pod", containerName))
-			_, err = runCommand("docker", "exec", containerName, "ip", "route", "add", addressesv4.srcPodIP, "via", addressesv4.nodeIP)
+			_, err = runCommand("docker", "exec", containerName, "ip", "route", "add", addressesv4.srcPodIP, "via", addressesv4.nodeIP, "dev", "eth0")
 			framework.ExpectNoError(err, "failed to add the pod host route on the test container %s", containerName)
 
 			ginkgo.By("Setting up the listeners on the gateway")
@@ -955,7 +975,7 @@ func setupBFDOnContainer(nodes []v1.Node) func(string) {
 	return func(containerName string) {
 		// we set a bfd peer for each address of each node
 		for _, node := range nodes {
-			ipv4, ipv6 := getNodeAddresses(&node)
+			ipv4, ipv6 := getContainerAddressesForNetwork(node.Name, *externalContainerNetwork)
 			for _, a := range []string{ipv4, ipv6} {
 				if a == "" {
 					continue
