@@ -1,0 +1,23 @@
+
+Summarizing 10 Failures:
+
+
+[Fail] e2e egress IP validation [It] Should validate the egress IP functionality against remote hosts with egress firewall applied 
+/home/fedepaol/devel/upstream/ovn-kubernetes/test/e2e/e2e.go:1104
+
+[Fail] e2e egress IP validation [It] Should validate the egress IP functionality against remote hosts 
+/home/fedepaol/devel/upstream/ovn-kubernetes/test/e2e/e2e.go:912
+
+[Fail] e2e non-vxlan external gateway and update validation [It] Should validate connectivity without vxlan before and after updating the namespace annotation to a new external gateway 
+/home/fedepaol/go/pkg/mod/github.com/onsi/ginkgo@v1.12.0/internal/leafnodes/runner.go:113
+
+[Fail] e2e non-vxlan external gateway through a gateway pod [It] Should validate connectivity to an external gateway's loopback address via a pod with external gateway annotations enabled 
+/home/fedepaol/go/pkg/mod/github.com/onsi/ginkgo@v1.12.0/internal/leafnodes/runner.go:113
+
+
+
+
+
+removed
+[Fail] e2e ingress gateway traffic validation [It] Should validate ingress connectivity from an external gateway 
+/home/fedepaol/go/pkg/mod/github.com/onsi/ginkgo@v1.12.0/internal/leafnodes/runner.go:113

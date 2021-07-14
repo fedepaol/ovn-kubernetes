@@ -1,0 +1,14 @@
+apiVersion: k8s.ovn.org/v1
+kind: EgressIP
+metadata:
+    name: egressip
+spec:
+    egressIPs:
+    - 172.18.1.4
+    - 172.18.1.5
+    podSelector:
+        matchLabels:
+            wants: egress
+    namespaceSelector:
+        matchLabels:
+            name: egressip-8081
