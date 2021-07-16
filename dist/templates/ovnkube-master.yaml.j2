@@ -265,6 +265,8 @@ spec:
             configMapKeyRef:
               name: ovn-config
               key: host_network_namespace
+        - name: OVN_EX_GW_NETWORK_INTERFACE
+          value: "{{ ovn_ex_gw_networking_interface }}"
       # end of container
 
       volumes:
